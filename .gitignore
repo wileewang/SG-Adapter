@@ -1,0 +1,8 @@
+*.png
+*ipynb
+*.pyc
+*.sh
+
+/output
+/__pycache__
+/scripts
