@@ -43,13 +43,16 @@ from transformers.utils import ContextManagers
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline
+from pipeline_stable_diffusion_text_sg import StableDiffusionTextSGPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-from models.gligen_unet import UNet2DConditionModel
+from diffusers.models import UNet2DConditionModel
 from utils.preprocess import *
+from utils.clip_util import *
+from models.text_updater import *
 
 
 if is_wandb_available():
@@ -65,7 +68,6 @@ DATASET_NAME_MAPPING = {
     "/home/luozhouwang/projects/Scene-Graph-Diffusion/SceneGraphDataset": ("image", "text", "Grounding"),
 }
 
-
 def make_image_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
 
@@ -75,7 +77,6 @@ def make_image_grid(imgs, rows, cols):
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
-
 
 def save_model_card(
     args,
@@ -151,11 +152,9 @@ More information on all the CLI arguments and the environment are available on y
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml + model_card)
 
-
-def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+def log_validation(vae, text_encoder, tokenizer, unet, adapter, args, accelerator, weight_dtype, global_step):
     logger.info("Running validation... ")
-
-    pipeline = StableDiffusionPipeline.from_pretrained(
+    pipeline = StableDiffusionTextSGPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae),
         text_encoder=accelerator.unwrap_model(text_encoder),
@@ -171,39 +170,69 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
-    if args.seed is None:
-        generator = None
+    # read validation_file
+    if args.validation_file is None:
+        logger.info("No validation file provided. Stop validation")
+    
     else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+        validation_inputs = load_jsonl(args.validation_file)
 
-    images = []
-    for i in range(len(args.validation_prompts)):
+        save_image_dir = os.path.join(args.output_dir, f"images-{global_step}")
+        os.makedirs(save_image_dir, exist_ok=True)
+
         with torch.autocast("cuda"):
-            image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+            for idx, validation_input in enumerate(validation_inputs):
 
-        images.append(image)
+                seed = args.seed
+                if args.seed is None:
+                    generator = None
+                else:
+                    generator = torch.Generator(device=accelerator.device).manual_seed(seed)
 
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            tracker.log(
-                {
-                    "validation": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
-                        for i, image in enumerate(images)
-                    ]
-                }
-            )
-        else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+                sg_embed = extract_sg_embed(
+                        objects=validation_input['objects'], 
+                        relations=validation_input['relations'], 
+                        text_encoder=pipeline.text_encoder, 
+                        tokenizer=pipeline.tokenizer, wo_triplet=args.wo_linear
+                    ).to(device=accelerator.device, dtype=weight_dtype)
+                
+                encoder_attention_mask = generate_encoder_attention_mask(
+                    tokenizer(validation_input['caption'], padding=True, return_tensors="pt").attention_mask
+                    ).repeat(2,1).to(device=accelerator.device, dtype=weight_dtype)
+                
+                if 'mapping' in validation_input.keys():
+                    sg_attention_mask = generate_sg_attention_mask(validation_input['mapping']).to(device=accelerator.device, dtype=weight_dtype)
+                    clip_attention_mask = generate_clip_attention_mask(validation_input['mapping']).to(device=accelerator.device, dtype=weight_dtype)
+                    self_attention_mask = generate_self_attention_mask(validation_input['mapping']).to(device=accelerator.device, dtype=weight_dtype)
+                else:
+                    sg_attention_mask = None
+                    clip_attention_mask = None
+                    self_attention_mask = None
+
+                draw_scene_graph(
+                    validation_input['objects'], validation_input['relations'], 
+                    output_filename=os.path.join(save_image_dir, f'{str(idx).zfill(3)}.png')
+                )
+
+                for _ in range(args.val_num_images_per_condition):
+                    image = pipeline(
+                            validation_input['caption'], 
+                            num_inference_steps=20, 
+                            generator=generator,
+                            adapter=accelerator.unwrap_model(adapter),
+                            sg_embed=sg_embed,
+                            encoder_attention_mask=encoder_attention_mask if args.use_encoder_attn_mask else None,
+                            sg_attention_mask=sg_attention_mask if args.use_sg_attn_mask else None,
+                            self_attention_mask=self_attention_mask if args.use_self_attn_mask else None,
+                            clip_attention_mask=clip_attention_mask if args.use_clip_attn_mask else None
+                        ).images[0]
+                    image.save(os.path.join(save_image_dir, f'{str(idx).zfill(3)}_{str(seed).zfill(3)}.png'))
+                    seed+=1
+                    generator.manual_seed(seed)
 
     del pipeline
     torch.cuda.empty_cache()
-
-    return images
-
+    return None
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -275,6 +304,28 @@ def parse_args():
         nargs="+",
         help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
     )
+
+    parser.add_argument(
+        "--validation_file",
+        type=str,
+        default=None,
+        help=("A path to validation conditions."),
+    )
+
+    parser.add_argument(
+        "--validation_steps",
+        type=int,
+        default=None,
+        help=("interval of validation"),
+    )
+
+    parser.add_argument(
+        "--val_num_images_per_condition",
+        type=int,
+        default=1,
+        help=("For each condition how many images are stored"),
+    )
+
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -486,6 +537,69 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--shuffle",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to shuffle the relation embedding."
+        ),
+    )
+
+    parser.add_argument(
+        "--use_encoder_attn_mask",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to padding the text embedding to 77 and compute the cross attention"
+        ),
+    )
+
+    parser.add_argument(
+        "--use_clip_attn_mask",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use clip attn mask"
+        ),
+    )
+
+    parser.add_argument(
+        "--use_sg_attn_mask",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use scene graph attn mask"
+        ),
+    )
+
+    parser.add_argument(
+        "--use_self_attn_mask",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to allow token attend in groups"
+        ),
+    )
+
+    parser.add_argument(
+        "--use_pooling",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to allow token pooling"
+        ),
+    )
+
+    parser.add_argument(
+        "--wo_linear",
+        default=False,
+        action="store_true",
+        help=(
+            "Whether to use all triple"
+        ),
+    )
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -500,7 +614,6 @@ def parse_args():
         args.non_ema_revision = args.revision
 
     return args
-
 
 def main():
     args = parse_args()
@@ -588,25 +701,32 @@ def main():
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision
         )
 
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision, ignore_mismatched_sizes=True,
-        low_cpu_mem_usage=False, device_map=None
-    )
-    # GLIGEN adapter layer
-
+        unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision, ignore_mismatched_sizes=True,
+            low_cpu_mem_usage=False, device_map=None
+        )
 
     # Freeze vae and text_encoder
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    register_attention_clip(text_encoder)
 
-    from models.gligen_attention import GatedSelfAttentionDense
-    for module in unet.modules():
-        if type(module) is GatedSelfAttentionDense:
-            module.enabled = True
-            module.requires_grad_(True)
-    unet.position_net.requires_grad_(True)
-
+    if args.use_self_attn_mask:
+        adapter = RelationAttentionWithSelfAttention(
+            sg_emb_dim=3080,
+            query_dim=1024,
+            n_heads=8,
+            d_head=128,
+        )
+    else:
+        adapter = RelationAttention(
+            sg_emb_dim=3080,
+            query_dim=1024,
+            n_heads=8,
+            d_head=128,
+            pooling=args.use_pooling
+        )
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -661,7 +781,7 @@ def main():
                 ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
 
             for i, model in enumerate(models):
-                model.save_pretrained(os.path.join(output_dir, "unet"))
+                model.save_pretrained(os.path.join(output_dir, "adapter"))
 
                 # make sure to pop weight so that corresponding model is not saved again
                 weights.pop()
@@ -715,7 +835,7 @@ def main():
 
     optimizer = optimizer_cls(
         # filter(lambda p: p.requires_grad, unet.parameters()),
-        unet.parameters(),
+        adapter.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -761,32 +881,29 @@ def main():
                 f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
             )
         
-    # if args.caption_column is None:
-    #     caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    # else:
-    #     caption_column = args.caption_column
-    #     if caption_column not in column_names:
-    #         raise ValueError(
-    #             f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-    #         )
+    if args.caption_column is None:
+        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+    else:
+        caption_column = args.caption_column
+        if caption_column not in column_names:
+            raise ValueError(
+                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+            )
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
     def tokenize_captions(examples, is_train=True):
-        # captions = []
-        # for caption in examples[caption_column]:
-        #     if isinstance(caption, str):
-        #         captions.append(caption)
-        #     elif isinstance(caption, (list, np.ndarray)):
-        #         # take a random caption if there are multiple
-        #         captions.append(random.choice(caption) if is_train else caption[0])
-        #     else:
-        #         raise ValueError(
-        #             f"Caption column `{caption_column}` should contain either strings or lists of strings."
-        #         )
         captions = []
-        for _ in examples['image']:
-            captions.append("")
+        for caption in examples[caption_column]:
+            if isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+            else:
+                raise ValueError(
+                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                )
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
@@ -801,16 +918,18 @@ def main():
             transforms.Normalize([0.5], [0.5]),
         ]
     )
-    
+
     def preprocess_train(examples, text_encoder, tokenizer):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
-        preprocess_scenegraph(examples, text_encoder, tokenizer)
+        preprocess_scenegraph(examples, text_encoder, tokenizer, args)
+        
         return examples
+
+    def preprocess_train_wrapper(examples):
+        return preprocess_train(examples, text_encoder, tokenizer)
     
-    def preprocess_train_wrapper(example):
-        return preprocess_train(example, text_encoder, tokenizer)
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
@@ -818,18 +937,7 @@ def main():
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train_wrapper)
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        positive_embeddings = torch.stack([example["positive_embeddings"] for example in examples])
-        masks = torch.stack([example["masks"] for example in examples])
-        return {
-                "pixel_values": pixel_values, 
-                "input_ids": input_ids,
-                "positive_embeddings": positive_embeddings,
-                "masks": masks
-            }
+
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -855,8 +963,8 @@ def main():
     )
 
     # Prepare everything with our `accelerator`.
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
+    adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        adapter, optimizer, train_dataloader, lr_scheduler
     )
 
     if args.use_ema:
@@ -873,6 +981,7 @@ def main():
         args.mixed_precision = accelerator.mixed_precision
 
     # Move text_encode and vae to gpu and cast to weight_dtype
+    unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
 
@@ -933,29 +1042,55 @@ def main():
     progress_bar.set_description("Steps")
 
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
+        adapter.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            if args.validation_file is not None and global_step % args.validation_steps == 0:
+                if accelerator.is_main_process:
+                    if args.use_ema:
+                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                        ema_unet.store(unet.parameters())
+                        ema_unet.copy_to(unet.parameters())
+                    # original_dtype = accelerator.unwrap_model(adapter).dtype
+                    log_validation(
+                        vae,
+                        text_encoder,
+                        tokenizer,
+                        unet,
+                        adapter,
+                        args,
+                        accelerator,
+                        weight_dtype,
+                        global_step,
+                    )
+                    # adapter = adapter.to(dtype=original_dtype)
+                    if args.use_ema:
+                        # Switch back to the original UNet parameters.
+                        ema_unet.restore(unet.parameters())
+                accelerator.wait_for_everyone()
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
-
-            with accelerator.accumulate(unet):
+            with accelerator.accumulate(adapter):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
-                # if cross_attention_kwargs is None:
-                cross_attention_kwargs = {}
-                cross_attention_kwargs['gligen'] = {
-                    # 'boxes': batch['boxes'].to(weight_dtype),
-                    'positive_embeddings': batch['positive_embeddings'].to(weight_dtype),
-                    'masks': batch['masks'].to(weight_dtype)
+                prompt_embed = text_encoder(
+                    batch["input_ids"], 
+                    attention_mask=batch["clip_attention_masks"] if args.use_clip_attn_mask else None
+                )[0]
 
-                    
-                }
+                updated_prompt_embed = adapter(
+                    prompt_embed, 
+                    batch["scenegraph_embeddings"], 
+                    cross_attention_mask=batch["sg_attention_masks"] if args.use_sg_attn_mask else None,
+                    self_attention_mask=batch["self_attention_masks"] if args.use_self_attn_mask else None
+                ).to(dtype=weight_dtype)
+
+                cross_attention_kwargs = {}
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -979,7 +1114,7 @@ def main():
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states = updated_prompt_embed
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -998,6 +1133,7 @@ def main():
                         noisy_latents, 
                         timesteps, 
                         encoder_hidden_states,
+                        encoder_attention_mask=batch['encoder_attention_masks'] if args.use_encoder_attn_mask else None,
                         cross_attention_kwargs=cross_attention_kwargs
                     ).sample
 
@@ -1025,7 +1161,7 @@ def main():
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(adapter.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1068,28 +1204,10 @@ def main():
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
+
+
             if global_step >= args.max_train_steps:
                 break
-
-        if accelerator.is_main_process:
-            if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
-                log_validation(
-                    vae,
-                    text_encoder,
-                    tokenizer,
-                    unet,
-                    args,
-                    accelerator,
-                    weight_dtype,
-                    global_step,
-                )
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()

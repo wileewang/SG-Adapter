@@ -27,10 +27,10 @@ from diffusers.utils import (
     is_accelerate_available,
     is_accelerate_version,
     logging,
-    randn_tensor,
     replace_example_docstring,
 )
-from diffusers.pipeline_utils import DiffusionPipeline
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 
@@ -55,7 +55,7 @@ EXAMPLE_DOC_STRING = """
 """
 
 
-class StableDiffusionGLIGENPipeline(DiffusionPipeline):
+class StableDiffusionTextSGPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion.
 
@@ -285,6 +285,7 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
         negative_prompt=None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        clip_attention_mask = None
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
@@ -346,7 +347,7 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
 
             prompt_embeds = self.text_encoder(
                 text_input_ids.to(device),
-                attention_mask=attention_mask,
+                attention_mask=clip_attention_mask,
             )
             prompt_embeds = prompt_embeds[0]
 
@@ -512,13 +513,7 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
         return latents
-
-    def enable_fuser(self, enabled=True):
-        from models.gligen_attention import GatedSelfAttentionDense
-        for module in self.unet.modules():
-            if type(module) is GatedSelfAttentionDense:
-                module.enabled = enabled
-
+    
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -528,8 +523,13 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
         width: Optional[int] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
-        gligen_scheduled_sampling_beta: float = 0.3,
-        gligen_relations: List[str] = None,
+        sg_scheduled_sampling_beta: float = 1.0,
+        sg_attention_mask = None,
+        self_attention_mask = None,
+        clip_attention_mask = None,
+        encoder_attention_mask = None,
+        sg_embed = None,
+        adapter = None,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
@@ -644,7 +644,20 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
             negative_prompt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
+            clip_attention_mask=clip_attention_mask
         )
+
+        if adapter is not None:
+            origin_prompt_embeds = prompt_embeds.clone()
+            if do_classifier_free_guidance:
+                # text_updater.to(prompt_embeds.dtype)
+                n = prompt_embeds.shape[0]
+                prompt_cond = prompt_embeds[n//2:,:,:]
+                prompt_cond = adapter(prompt_cond, sg_embed, cross_attention_mask=sg_attention_mask, self_attention_mask=self_attention_mask)
+                prompt_embeds[n//2:,:,:] = prompt_cond
+            else:
+                # text_updater.to(prompt_embeds.dtype)
+                prompt_embeds = adapter(prompt_embeds, sg_embed, cross_attention_mask=sg_attention_mask, self_attention_mask=self_attention_mask)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -672,46 +685,10 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
             return inpaint_mask
 
         # 5.1 Prepare GLIGEN variables
-        if gligen_relations is not None:
-            device = self.text_encoder.device
-            dtype = self.text_encoder.dtype
-            assert batch_size == 1
-            max_relations = 30
-            triplets = []
-            for relation in gligen_relations:
-                tokenizer_inputs = self.tokenizer(relation, padding=True, return_tensors="pt").to(self.text_encoder.device)
-                _relation_embedding = self.text_encoder(**tokenizer_inputs).pooler_output
-                flattened_relation_embedding = _relation_embedding.flatten(start_dim=0).unsqueeze(0)
-                triplets.append(flattened_relation_embedding)
+        if cross_attention_kwargs is None:
+            cross_attention_kwargs = {}
 
-            _scenegraph_embedding = torch.cat(triplets, dim=0)
-            n_relations = min(len(_scenegraph_embedding), max_relations)
-
-            scenegraph_embedding = torch.zeros(max_relations, 768*3, device=device, dtype=dtype)
-            scenegraph_embedding[:n_relations] = _scenegraph_embedding[:n_relations]
-
-            masks = torch.zeros(max_relations, device=device, dtype=dtype)
-            masks[:n_relations] = 1
-
-            repeat_batch = batch_size * num_images_per_prompt
-            if do_classifier_free_guidance:
-                repeat_batch = repeat_batch * 2
-
-            scenegraph_embedding = scenegraph_embedding.unsqueeze(0).expand(repeat_batch, -1, -1).clone()
-            masks = masks.unsqueeze(0).expand(repeat_batch, -1).clone()
-
-            if do_classifier_free_guidance:
-                masks[:repeat_batch // 2] = 0
-            if cross_attention_kwargs is None:
-                cross_attention_kwargs = {}
-            
-            cross_attention_kwargs['gligen'] = {
-                'positive_embeddings': scenegraph_embedding,
-                'masks': masks
-            }
-
-        num_grounding_steps = int(gligen_scheduled_sampling_beta * len(timesteps))
-        self.enable_fuser(True)
+        num_grounding_steps = int(sg_scheduled_sampling_beta * len(timesteps))
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -721,13 +698,15 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Scheduled sampling
-                if i == num_grounding_steps:
-                    self.enable_fuser(False)
+
+                if i == num_grounding_steps and adapter is not None:
+                    prompt_embeds = origin_prompt_embeds
 
                 if latents.shape[1] != 4:
                     latents = torch.randn_like(latents[:, :4])
 
                 # expand the latents if we are doing classifier free guidance
+
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
@@ -736,6 +715,7 @@ class StableDiffusionGLIGENPipeline(DiffusionPipeline):
                     latent_model_input,
                     t,
                     encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=encoder_attention_mask,
                     cross_attention_kwargs=cross_attention_kwargs,
                 ).sample
 
